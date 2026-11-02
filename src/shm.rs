@@ -1,7 +1,5 @@
-// Kitty's shared memory transfer (t=s). Frames go into POSIX shared memory
-// objects that the terminal reads directly, skipping compression, base64 and
-// the terminal stream. It only works when the terminal runs on the same
-// machine, so support is checked first.
+// Kitty's shared memory transfer (t=s): frames skip compression, base64 and
+// the terminal stream. Only works when the terminal runs on the same machine.
 
 use std::{
     collections::VecDeque,
@@ -20,28 +18,20 @@ use rustix::{
     shm,
 };
 
-// How long to wait for the terminal to answer the support query
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
-// Frames written but not yet read, like the writer thread's one in progress
-// and one queued. The terminal removes each object once it has read it.
+// The terminal removes each object once it has read it
 const MAX_UNREAD: usize = 2;
 // If the terminal reads nothing for this long, shared memory isn't working
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
-// When frames may be skipped on purpose, how long the oldest unread one waits
-// before it's removed. Removing one the terminal was about to read loses that
-// frame, so this leaves a busy terminal time to catch up.
+// With skip_unread, how long the oldest unread frame waits before removal
 const SKIP_TIMEOUT: Duration = Duration::from_millis(100);
 
-// Numbers object names, so no two in this process collide
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-// Shared memory objects holding frames for the terminal to read
 pub struct SharedFrames {
     unread: VecDeque<String>,
-    // Remove unread frames and carry on, rather than give up on shared memory
     skip_unread: bool,
     read_timeout: Duration,
-    // Set once the terminal stops reading; frames then go inline instead
     failed: bool,
 }
 
@@ -61,7 +51,6 @@ impl SharedFrames {
         }
     }
 
-    // Copy a frame into a new shared memory object and return its name
     pub fn write(&mut self, data: &[u8]) -> io::Result<String> {
         if self.failed {
             return Err(io::Error::other(
@@ -77,9 +66,8 @@ impl SharedFrames {
         Ok(name)
     }
 
-    // Only a tiny command goes through the terminal stream, so unlike inline
-    // pixels it doesn't hold dcat back when the terminal falls behind. Wait
-    // here for the terminal to read earlier frames instead.
+    // Only a tiny command goes through the terminal stream, so nothing else
+    // stops us running ahead of the terminal
     fn wait_for_reads(&mut self) -> io::Result<()> {
         let deadline = Instant::now() + self.read_timeout;
         loop {
@@ -117,7 +105,6 @@ impl Drop for SharedFrames {
     }
 }
 
-// Whether an object is still there, so not yet read by the terminal
 fn exists(name: &str) -> bool {
     shm::open(name, shm::OFlags::RDONLY, Mode::empty()).is_ok()
 }
@@ -135,8 +122,7 @@ fn write_object(name: &str, data: &[u8]) -> io::Result<()> {
     Ok(result?)
 }
 
-// Linux can write to shared memory directly. That fills the pages without a
-// fault on each one, which takes around a third less time than mapping it.
+// Writing directly avoids a fault per page, about a third faster than mmap
 #[cfg(target_os = "linux")]
 fn fill(fd: &OwnedFd, data: &[u8]) -> rustix::io::Result<()> {
     let mut written = 0;
@@ -146,7 +132,7 @@ fn fill(fd: &OwnedFd, data: &[u8]) -> rustix::io::Result<()> {
     Ok(())
 }
 
-// Elsewhere, macOS included, shared memory can only be written through a mapping
+// macOS can only write shared memory through a mapping
 #[cfg(not(target_os = "linux"))]
 fn fill(fd: &OwnedFd, data: &[u8]) -> rustix::io::Result<()> {
     use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
@@ -172,16 +158,15 @@ fn fill(fd: &OwnedFd, data: &[u8]) -> rustix::io::Result<()> {
     }
 }
 
-// Ask the terminal whether it can read frames from shared memory. Must run in
-// raw mode, before anything else reads input.
+// Must run in raw mode, before anything else reads input
 pub fn terminal_supports() -> bool {
     let name = format!("/dcat-{}-probe", process::id());
     if write_object(&name, &[0; 3]).is_err() {
         return false;
     }
 
-    // A device attributes query follows, which every terminal answers, so
-    // there's no need to wait out the timeout when the first goes unanswered
+    // Every terminal answers the trailing device attributes query, so there's
+    // no waiting out the timeout when the first goes unanswered
     let query = format!(
         "\x1b_Gi=31,s=1,v=1,a=q,t=s,f=24;{}\x1b\\\x1b[c",
         BASE64.encode(&name)
@@ -252,7 +237,6 @@ mod tests {
             // macOS limits shared memory names to 31 characters
             assert!(name.len() <= 31, "{name}");
 
-            // Read it back the way the terminal does
             let fd = shm::open(name.as_str(), shm::OFlags::RDONLY, Mode::empty()).unwrap();
             let read = unsafe {
                 let map = mmap(
@@ -271,11 +255,10 @@ mod tests {
             assert_eq!(read, data);
             name
         };
-        // Dropping removes objects the terminal hasn't read
         assert!(shm::open(name.as_str(), shm::OFlags::RDONLY, Mode::empty()).is_err());
     }
 
-    // Stands in for the terminal: reads (removes) every object it's given
+    // Stands in for the terminal
     fn read_all(names: &[String]) {
         for name in names {
             shm::unlink(name.as_str()).unwrap();
@@ -288,8 +271,6 @@ mod tests {
         let first = frames.write(&[1, 2, 3]).unwrap();
         let second = frames.write(&[1, 2, 3]).unwrap();
 
-        // A reader in another thread catches up after a short while; the
-        // third write has to wait for it rather than run ahead
         let reader = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             read_all(&[first, second]);
@@ -314,7 +295,6 @@ mod tests {
             .collect();
 
         assert!(frames.write(&[1, 2, 3]).is_err());
-        // Its unread objects are removed, and it doesn't try again
         assert!(names.iter().all(|name| !exists(name)));
         assert!(frames.write(&[1, 2, 3]).is_err());
     }
@@ -327,7 +307,6 @@ mod tests {
             .map(|_| frames.write(&[1, 2, 3]).unwrap())
             .collect();
 
-        // Only the newest frames are kept for the terminal to read
         let kept = names.split_off(names.len() - MAX_UNREAD);
         assert!(names.iter().all(|name| !exists(name)));
         assert!(kept.iter().all(|name| exists(name)));

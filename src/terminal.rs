@@ -33,9 +33,8 @@ pub struct Options {
     /// image each frame. A printed frame goes without one unless given, so
     /// later ones don't replace it.
     pub kitty_image_id: Option<u32>,
-    /// Send Kitty frames through shared memory without asking the terminal
-    /// first, removing frames it leaves unread. For callers that know the
-    /// terminal reads shared memory but may skip frames.
+    /// Send Kitty frames through shared memory without querying the terminal,
+    /// removing frames it leaves unread
     pub kitty_shared_memory: bool,
     /// Capture the mouse, reporting positions in pixels where supported
     pub mouse_capture: bool,
@@ -44,12 +43,10 @@ pub struct Options {
     pub key_releases: bool,
 }
 
-// Source pixels covered by one character cell in the character modes
 const CHARACTER_CELL_PIXELS: (u32, u32) = (output::CELL_COLUMNS as u32, output::CELL_ROWS as u32);
-// Assumed cell size when the terminal doesn't report its size in pixels
 const FALLBACK_CELL_PIXELS: (u32, u32) = (10, 20);
 
-// Report mouse positions in pixels rather than cells (SGR-Pixels)
+// SGR-Pixels mouse reporting
 const ENABLE_PIXEL_MOUSE: &str = "\x1b[?1016h";
 const DISABLE_PIXEL_MOUSE: &str = "\x1b[?1016l";
 
@@ -57,14 +54,11 @@ const DISABLE_PIXEL_MOUSE: &str = "\x1b[?1016l";
 static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 static FOCUS_REPORTED: AtomicBool = AtomicBool::new(false);
-// The id of the Kitty image dcat shows, or 0 for none
+// 0 for none
 static KITTY_IMAGE_SHOWN: AtomicU32 = AtomicU32::new(0);
-// Whether Kitty commands have to be passed through tmux
 static KITTY_IN_TMUX: AtomicBool = AtomicBool::new(false);
 static SIXEL_SCROLLING_DISABLED: AtomicBool = AtomicBool::new(false);
 
-// Pixels covered by one character cell. A given size wins over the terminal's,
-// for ptys that report none, like the ones Neovim jobs run in.
 fn cell_pixels(mode: OutputMode, cell_size: Option<(u32, u32)>) -> (u32, u32) {
     if mode.uses_characters() {
         return CHARACTER_CELL_PIXELS;
@@ -81,12 +75,10 @@ fn cell_pixels(mode: OutputMode, cell_size: Option<(u32, u32)>) -> (u32, u32) {
     }
 }
 
-// The id of the image the viewer shows and replaces each frame
 fn kitty_image_id(options: &Options) -> u32 {
     options.kitty_image_id.unwrap_or(1)
 }
 
-// Whether the terminal says it can read frames from shared memory
 fn terminal_reads_shared_memory() -> bool {
     #[cfg(unix)]
     let supported = crate::shm::terminal_supports();
@@ -95,18 +87,15 @@ fn terminal_reads_shared_memory() -> bool {
     supported
 }
 
-// Rows below the image: the status bar, and for Sixel a spare row so the
-// image never reaches the bottom of the screen and scrolls it
+// The status bar, and for Sixel a spare row so the image can't scroll the screen
 fn reserved_rows(mode: OutputMode, status_bar: bool) -> u16 {
     u16::from(status_bar || mode == OutputMode::Sixel)
 }
 
-// Size assumed for printed frames when output isn't going to a terminal
 const REDIRECTED_SIZE: (u16, u16) = (80, 24);
 
-/// Pixel size of frames that fill the terminal, leaving a row for the status
-/// bar if one is shown, and for Sixel a spare row so the image can't scroll
-/// the screen
+/// Pixel size of frames that fill the terminal, less the status bar and, for
+/// Sixel, a spare row
 pub fn screen_size(
     mode: OutputMode,
     options: &Options,
@@ -138,44 +127,36 @@ pub struct Terminal {
     mode: OutputMode,
     cell_size: Option<(u32, u32)>,
     reports_key_releases: bool,
-    // None once stopped, which only happens on drop or after a write error
+    // None once stopped
     writer: Option<FrameWriter>,
 }
 
 enum WriterJob {
     Frame {
-        // Tightly packed RGBA
         pixels: Vec<u8>,
         width: u32,
         height: u32,
         status: Option<String>,
-        // Terminal size in cells and cell size in pixels when the frame was rendered
         size: (u16, u16),
         cell_pixels: (u32, u32),
     },
     Clear,
 }
 
-// Encodes and writes frames on a background thread, so encoding one frame and
-// the terminal reading it overlap rendering the next. The job channel holds
-// nothing: sending waits until the writer is free, so at most one frame is in
-// progress behind the one being rendered.
+// Encodes and writes frames on a background thread. The job channel is a
+// rendezvous, so at most one frame is in progress behind the one being rendered.
 struct FrameWriter {
     jobs: SyncSender<WriterJob>,
-    // Pixel buffers handed back for reuse, so big frames aren't reallocated
     recycled: Receiver<Vec<u8>>,
     thread: JoinHandle<io::Result<()>>,
 }
 
-// Whether Kitty frames go through shared memory
 #[derive(Clone, Copy, PartialEq)]
 enum SharedMemory {
     Off,
-    // The terminal said it reads it, or likely does. If it stops, frames go
-    // inline instead.
+    // Falls back to inline if the terminal stops reading
     Likely,
-    // The caller says the terminal reads it, but frames may be skipped, like
-    // dcat.nvim does while its viewer is hidden. Unread ones are removed.
+    // The caller may skip frames; unread ones are removed
     Assumed,
 }
 
@@ -268,8 +249,8 @@ impl FrameWriter {
 impl Terminal {
     /// Take over the terminal to draw frames in `mode`
     pub fn new(mode: OutputMode, options: &Options) -> io::Result<Self> {
-        // Restore the terminal before the panic message is printed, otherwise
-        // it is lost on the alternate screen.
+        // Restore before the panic message prints, or it's lost on the
+        // alternate screen
         let default_hook = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
             restore();
@@ -296,11 +277,8 @@ impl Terminal {
             MOUSE_CAPTURED.store(true, Ordering::SeqCst);
         }
 
-        // Kitty can read frames from shared memory when it runs on this
-        // machine. The query reads the reply itself, so it must come before
-        // anything else reads input. It can be skipped when the caller knows
-        // better, like inside Neovim, whose terminal answers part of it itself.
-        // Inside tmux, Kitty commands have to be passed through it
+        // The shared memory query reads stdin, so it must come before anything
+        // else does
         let tmux = mode == OutputMode::Kitty && std::env::var_os("TMUX").is_some();
         KITTY_IN_TMUX.store(tmux, Ordering::SeqCst);
         let over_ssh = ["SSH_CONNECTION", "SSH_TTY"]
@@ -311,9 +289,8 @@ impl Terminal {
         } else if options.kitty_shared_memory {
             SharedMemory::Assumed
         } else if tmux {
-            // tmux would take the query for a window title, and shows Kitty its
-            // own answer. Shared memory is tried anyway unless over SSH, since
-            // big inline frames back up in tmux until it drops some.
+            // tmux mistakes the query for a window title. Try anyway unless over
+            // SSH, since big inline frames back up in tmux.
             if over_ssh {
                 SharedMemory::Off
             } else {
@@ -325,11 +302,8 @@ impl Terminal {
             SharedMemory::Off
         };
 
-        // First-person movement needs key releases. The Windows console reports
-        // them natively; elsewhere they need the Kitty keyboard protocol. A
-        // terminal that doesn't answer the query is treated as not supporting it.
-        // Neovim's terminal answers it, but never gets releases itself from the
-        // terminal it runs in, so keys would stay held.
+        // Neovim's terminal claims keyboard enhancement but never gets
+        // releases itself, so keys would stay held
         let mut reports_key_releases = cfg!(windows);
         if options.key_releases
             && !reports_key_releases
@@ -361,9 +335,7 @@ impl Terminal {
         })
     }
 
-    /// Whether key presses come with release events, from the Windows console
-    /// or, when asked for with [`Options::key_releases`], the Kitty keyboard
-    /// protocol
+    /// Whether key releases are reported; see [`Options::key_releases`]
     pub fn reports_key_releases(&self) -> bool {
         self.reports_key_releases
     }
@@ -415,12 +387,11 @@ impl Terminal {
         if sent {
             return Ok(());
         }
-        // The writer only stops early when writing failed; report why
+        // The writer only stops early on a write error
         self.stop_writer()?;
         Err(io::Error::other("frame writer stopped"))
     }
 
-    // Wait for queued output to be written, returning the writer's error if it failed
     fn stop_writer(&mut self) -> io::Result<()> {
         let Some(writer) = self.writer.take() else {
             return Ok(());
@@ -433,18 +404,13 @@ impl Terminal {
     }
 }
 
-// Everything written to the terminal for one frame: the image in the given
-// mode and the status bar, fitted to a terminal of `cols` by `rows` cells
-// Writes a frame's pixels to shared memory and returns the object's name
 type WriteShared<'a> = dyn FnMut(&[u8]) -> io::Result<String> + 'a;
 
-// How Kitty frames are sent
 struct KittyImage<'a> {
     id: u32,
     // None to send the pixels inline
     write_shared: Option<&'a mut WriteShared<'a>>,
-    // Inside tmux, the size of the placeholder text last drawn. tmux keeps
-    // it, so it's only drawn again when that changes.
+    // Inside tmux, the placeholder size last drawn, which tmux keeps
     placeholders_drawn: Option<&'a mut Option<(u16, u16)>>,
 }
 
@@ -480,7 +446,6 @@ fn compose_frame(
             output::encode_mono_blocks(frame, (cols_used, rows_used), Layout::Screen, out)?;
         }
         OutputMode::Kitty | OutputMode::Sixel => {
-            // Crop anything that wouldn't fit on screen
             let max_width = u32::from(cols) * cell_width;
             let max_height = u32::from(image_rows) * cell_height;
             let cropped;
@@ -498,8 +463,6 @@ fn compose_frame(
             queue!(out, MoveTo(0, 0))?;
             if frame.width > 0 && frame.height > 0 {
                 if mode == OutputMode::Kitty {
-                    // Inside tmux the image goes in a virtual placement, which
-                    // placeholder text shows
                     let cells = (
                         frame.width.div_ceil(cell_width) as u16,
                         frame.height.div_ceil(cell_height) as u16,
@@ -517,8 +480,6 @@ fn compose_frame(
                         Some(Ok(name)) => {
                             output::encode_kitty_shared(frame, placement, &name, out)?;
                         }
-                        // Without shared memory, or if writing it failed,
-                        // send the pixels in the escape sequence
                         _ => output::encode_kitty(frame, placement, out)?,
                     }
                     if let Some(drawn) = kitty.placeholders_drawn {
@@ -561,8 +522,7 @@ fn compose_frame(
     Ok(())
 }
 
-/// Print one frame at the cursor like text, for --once, leaving the cursor
-/// below it
+/// Print one frame at the cursor like text, leaving the cursor below it
 pub fn print_frame(mode: OutputMode, options: &Options, frame: Frame) -> io::Result<()> {
     let mut out = Vec::new();
     let tmux = std::env::var_os("TMUX").is_some();
@@ -585,7 +545,7 @@ fn compose_inline(
     (kitty_image_id, tmux): (Option<u32>, bool),
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // The frame was rendered to fit, so every cell of it is shown
+    // Printed frames are sized to fit, so show every cell
     let all = (usize::MAX, usize::MAX);
     match mode {
         OutputMode::TruecolorCharacters => {
@@ -597,12 +557,8 @@ fn compose_inline(
         OutputMode::BlockCharacters => {
             output::encode_mono_blocks(frame, all, Layout::Inline, out)?;
         }
-        // Inside tmux, placeholder text shows the image, so it scrolls with
-        // the rest of the pane
         OutputMode::Kitty if tmux => {
-            // Printed images stay in the scrollback, so each needs its own id,
-            // which a later image with the same one would replace. The
-            // placeholders name it, in a 256-color index tmux passes on.
+            // Printed images stay in the scrollback, so each needs its own id
             let id = kitty_image_id.unwrap_or(std::process::id() % 255 + 1);
             let cells = (
                 frame.width.div_ceil(cell_width) as u16,
@@ -617,7 +573,6 @@ fn compose_inline(
             output::wrap_for_tmux(&commands, out);
             output::encode_kitty_placeholders(id, cells, Layout::Inline, out)?;
         }
-        // Without an id unless given one, so no later image replaces it
         OutputMode::Kitty => {
             let placement = KittyPlacement {
                 image_id: kitty_image_id,
@@ -683,7 +638,6 @@ mod tests {
     const PIXEL_CELL_SIZE: (u32, u32) = (10, 20);
     const SHAPES: &str = "▘▝▖▗▀▄▌▐▚▞▛▜▙▟▂▆";
 
-    // Feed a composed frame through a terminal emulator of the given size
     fn screen(
         mode: OutputMode,
         frame: Frame,
@@ -719,15 +673,13 @@ mod tests {
         for mode in [OutputMode::Kitty, OutputMode::Sixel] {
             assert_eq!(cell_pixels(mode, Some((9, 18))), (9, 18), "{mode:?}");
         }
-        // Character modes always sample the same pixels per cell
         assert_eq!(
             cell_pixels(OutputMode::TruecolorCharacters, Some((9, 18))),
             CHARACTER_CELL_PIXELS
         );
     }
 
-    // RGBA pixels covering `cols` by `rows` cells. Each cell has two colors
-    // laid out as a different block shape, so every cell can be shown exactly.
+    // Each cell gets a two-color block shape, so it can be shown exactly
     fn shaped_frame(cols: usize, rows: usize) -> (u32, u32, Vec<u8>) {
         let (width, height) = (cols * CELL_COLUMNS, rows * CELL_ROWS);
         let shapes: Vec<char> = SHAPES.chars().collect();
@@ -750,7 +702,6 @@ mod tests {
         (width as u32, height as u32, pixels)
     }
 
-    // The source pixels of one cell
     fn source_cell(pixels: &[u8], width: u32, col: u16, row: u16) -> Vec<[u8; 3]> {
         (0..CELL_ROWS)
             .flat_map(|dy| (0..CELL_COLUMNS).map(move |dx| (dx, dy)))
@@ -763,7 +714,6 @@ mod tests {
             .collect()
     }
 
-    // The pixels a terminal cell shows, as the colors of its two regions
     fn shown_cell(parser: &vt100::Parser, col: u16, row: u16) -> Vec<Vt> {
         let cell = parser.screen().cell(row, col).unwrap();
         let symbol = cell.contents().chars().next().unwrap_or(' ');
@@ -867,7 +817,6 @@ mod tests {
             (4, 3),
         );
 
-        // The image keeps the rows above, and the status is cut to the width
         let image_row = row_text(&parser, 1, 4);
         assert_eq!(image_row.chars().count(), 4);
         assert!(
@@ -928,7 +877,6 @@ mod tests {
 
     #[test]
     fn image_protocols_leave_no_text_behind() {
-        // A frame larger than the screen, so cropping is exercised too
         let pixels = vec![120; 50 * 70 * 4];
         let frame = Frame {
             width: 50,
@@ -976,7 +924,6 @@ mod tests {
             written.push(data.len());
             Ok("/dcat-test".into())
         });
-        // The frame went to shared memory and only its name to the terminal
         assert_eq!(written, [20 * 40 * 4]);
         assert!(text.contains("t=s,"), "{text}");
         assert!(!text.contains("o=z"), "{text}");
@@ -1012,7 +959,6 @@ mod tests {
         };
 
         let first = compose(&mut drawn);
-        // The image goes through tmux into a 2x2 cell virtual placement
         assert!(
             !first.replace("\x1b\x1b", "").contains("\x1b_G"),
             "{first:?}"
@@ -1024,7 +970,6 @@ mod tests {
 
         assert!(!first.contains("\x1b[?2026h"), "{first:?}");
 
-        // tmux keeps the placeholders, so they aren't sent again
         let second = compose(&mut drawn);
         assert!(second.contains("\x1bPtmux;"));
         assert_eq!(second.matches('\u{10EEEE}').count(), 0);
@@ -1052,11 +997,8 @@ mod tests {
             pixels: &pixels,
         };
         let out = print_inline(OutputMode::TruecolorCharacters, frame, false);
-        // Nothing is placed at a fixed screen position
         assert!(!String::from_utf8_lossy(&out).contains('H'), "{out:?}");
 
-        // Printed below a line of text, every cell comes out right, and the
-        // cursor ends up on the line after
         let mut parser =
             vt100::Parser::new(NonZeroU16::new(6).unwrap(), NonZeroU16::new(10).unwrap(), 0);
         parser.process(b"$ dcat\r\n");
@@ -1086,15 +1028,12 @@ mod tests {
             pixels: &pixels,
         };
         let text = String::from_utf8(print_inline(OutputMode::Kitty, frame, false)).unwrap();
-        // Without an id, so a later image can't replace it
         assert!(
             text.starts_with("\x1b_Ga=T,f=32,o=z,s=20,v=40,q=2,m=0;"),
             "{text:?}"
         );
-        // Kitty leaves the cursor beside the image's last row
         assert!(text.ends_with("\x1b\\\r\n"), "{text:?}");
 
-        // Inside tmux, placeholder text follows the image, ending on a new line
         let text = String::from_utf8(print_inline(OutputMode::Kitty, frame, true)).unwrap();
         assert!(text.starts_with("\x1bPtmux;"), "{text:?}");
         assert!(text.contains(",U=1,c=2,r=2,"), "{text:?}");
