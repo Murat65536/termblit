@@ -1,6 +1,9 @@
-use std::io::{self, Write};
+use std::{io, ops::Range, sync::OnceLock};
 
-use super::Frame;
+use super::{
+    Frame,
+    parallel::{available_threads, split_across},
+};
 
 // 4x4 ordered dither thresholds, in sixteenths
 const BAYER_4X4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
@@ -33,18 +36,22 @@ fn sixel_level_table(levels: usize) -> [[u8; 256]; 16] {
     table
 }
 
-// Map each pixel to a palette entry, dithering so gradients don't band
-fn sixel_quantize(frame: Frame) -> Vec<u8> {
-    let [r_levels, g_levels, b_levels] = SIXEL_LEVELS;
-    let (r_table, g_table, b_table) = (
-        sixel_level_table(r_levels),
-        sixel_level_table(g_levels),
-        sixel_level_table(b_levels),
-    );
+// The tables for red, green and blue
+fn sixel_level_tables() -> &'static [[[u8; 256]; 16]; 3] {
+    static TABLES: OnceLock<[[[u8; 256]; 16]; 3]> = OnceLock::new();
+    TABLES.get_or_init(|| SIXEL_LEVELS.map(sixel_level_table))
+}
+
+// Map each pixel of these rows to a palette entry, dithering so gradients
+// don't band
+fn sixel_quantize_rows(frame: Frame, rows: Range<usize>) -> Vec<u8> {
+    let [_, g_levels, b_levels] = SIXEL_LEVELS;
+    let [r_table, g_table, b_table] = sixel_level_tables();
 
     let width = frame.width as usize;
-    let mut indices = Vec::with_capacity(width * frame.height as usize);
-    for (y, row) in frame.pixels.chunks_exact(width * 4).enumerate() {
+    let mut indices = Vec::with_capacity(width * rows.len());
+    let pixels = &frame.pixels[rows.start * width * 4..rows.end * width * 4];
+    for (row, y) in pixels.chunks_exact(width * 4).zip(rows) {
         let thresholds = &BAYER_4X4[y % 4];
         for (x, [r, g, b, _]) in row.as_chunks::<4>().0.iter().enumerate() {
             let t = thresholds[x % 4] as usize;
@@ -57,24 +64,73 @@ fn sixel_quantize(frame: Frame) -> Vec<u8> {
     indices
 }
 
+#[cfg(test)]
+fn sixel_quantize(frame: Frame) -> Vec<u8> {
+    sixel_quantize_rows(frame, 0..frame.height as usize)
+}
+
+// Threads are worth starting only for at least this many pixels each
+const MIN_PIXELS_PER_THREAD: usize = 32 * 1024;
+
 pub fn encode_sixel(frame: Frame, out: &mut Vec<u8>) -> io::Result<()> {
     let width = frame.width as usize;
     let height = frame.height as usize;
-    let indices = sixel_quantize(frame);
+    let threads = available_threads().min(width * height / MIN_PIXELS_PER_THREAD);
+    let parts = split_across(height.div_ceil(6), threads, |bands| {
+        encode_bands(frame, bands)
+    });
 
     // Start sixel data with 1:1 pixel aspect ratio and the image size
-    write!(out, "\x1bPq\"1;1;{width};{height}")?;
+    out.extend_from_slice(b"\x1bPq\"1;1;");
+    push_number(width, out);
+    out.push(b';');
+    push_number(height, out);
+
+    let mut used = [false; SIXEL_PALETTE_SIZE];
+    for part in &parts {
+        for (used, &part_used) in used.iter_mut().zip(&part.used) {
+            *used |= part_used;
+        }
+    }
+    for (index, _) in used.iter().enumerate().filter(|&(_, &used)| used) {
+        let [r, g, b] = sixel_palette_color(index).map(|c| usize::from(c) * 100 / 255);
+        out.push(b'#');
+        push_number(index, out);
+        out.extend_from_slice(b";2;");
+        for (i, value) in [r, g, b].into_iter().enumerate() {
+            if i > 0 {
+                out.push(b';');
+            }
+            push_number(value, out);
+        }
+    }
+
+    for part in parts {
+        out.extend_from_slice(&part.data);
+    }
+    out.extend_from_slice(b"\x1b\\");
+    Ok(())
+}
+
+// The sixel data for some six-row bands, and the palette entries it uses
+struct Bands {
+    used: [bool; SIXEL_PALETTE_SIZE],
+    data: Vec<u8>,
+}
+
+fn encode_bands(frame: Frame, bands: Range<usize>) -> Bands {
+    let width = frame.width as usize;
+    let rows = bands.start * 6..(bands.end * 6).min(frame.height as usize);
+    let height = rows.len();
+    let indices = sixel_quantize_rows(frame, rows);
 
     let mut used = [false; SIXEL_PALETTE_SIZE];
     for &index in &indices {
         used[index as usize] = true;
     }
-    for (index, _) in used.iter().enumerate().filter(|&(_, &used)| used) {
-        let [r, g, b] = sixel_palette_color(index).map(|c| u32::from(c) * 100 / 255);
-        write!(out, "#{index};2;{r};{g};{b}")?;
-    }
 
     // Each six-row band draws one line of sixels per color, overprinting
+    let mut data = Vec::new();
     let mut band_bits = vec![0u8; SIXEL_PALETTE_SIZE * width];
     let mut spans = vec![(usize::MAX, 0usize); SIXEL_PALETTE_SIZE];
     let mut band_colors = Vec::with_capacity(SIXEL_PALETTE_SIZE);
@@ -98,42 +154,61 @@ pub fn encode_sixel(frame: Frame, out: &mut Vec<u8>) -> io::Result<()> {
         for (i, &color) in band_colors.iter().enumerate() {
             if i > 0 {
                 // Back to the start of the band for the next color
-                out.push(b'$');
+                data.push(b'$');
             }
-            write!(out, "#{color}")?;
-            // Nothing needs drawing after the color's last column
+            data.push(b'#');
+            push_number(color, &mut data);
+            // Blank up to the color's first column, and nothing after its last
             let (start, end) = spans[color];
+            push_run(b'?', start, &mut data);
             let row = &mut band_bits[color * width..(color + 1) * width];
-            write_sixel_runs(&row[..=end], out)?;
+            write_sixel_runs(&row[start..=end], &mut data);
 
             // Reset only what this band used
             row[start..=end].fill(0);
             spans[color] = (usize::MAX, 0);
         }
         band_colors.clear();
-        out.push(b'-');
+        data.push(b'-');
     }
+    Bands { used, data }
+}
 
-    out.extend_from_slice(b"\x1b\\");
-    Ok(())
+fn push_number(value: usize, out: &mut Vec<u8>) {
+    let mut digits = [0; 20];
+    let mut start = digits.len();
+    let mut rest = value;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[start..]);
+}
+
+// A character repeated, run-length encoded when that's shorter
+fn push_run(character: u8, run: usize, out: &mut Vec<u8>) {
+    if run > 3 {
+        out.push(b'!');
+        push_number(run, out);
+        out.push(character);
+    } else {
+        out.extend(std::iter::repeat_n(character, run));
+    }
 }
 
 // Write one line of sixels, run-length encoding repeats
-fn write_sixel_runs(bits: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+fn write_sixel_runs(bits: &[u8], out: &mut Vec<u8>) {
     let mut x = 0;
     while x < bits.len() {
         let value = bits[x];
         let run = bits[x..].iter().take_while(|&&b| b == value).count();
-        let character = b'?' + value;
-        if run > 3 {
-            write!(out, "!{run}")?;
-            out.push(character);
-        } else {
-            out.extend(std::iter::repeat_n(character, run));
-        }
+        push_run(b'?' + value, run, out);
         x += run;
     }
-    Ok(())
 }
 
 // Stops sixel images from scrolling the screen and places them at the top left
@@ -210,27 +285,34 @@ mod tests {
 
     #[test]
     fn sixel_round_trip() {
-        // A gradient across several bands, with a partial last band
-        let (width, height) = (37usize, 15usize);
-        let pixels: Vec<u8> = (0..width * height)
-            .flat_map(|i| {
-                let (x, y) = (i % width, i / width);
-                [(x * 7) as u8, (y * 17) as u8, 128, 255]
-            })
-            .collect();
-        let frame = Frame {
-            width: width as u32,
-            height: height as u32,
-            pixels: &pixels,
-        };
+        // Gradients across several bands, with a partial last band. The
+        // bigger is split across threads.
+        for (width, height) in [(37usize, 15usize), (401, 257)] {
+            assert_eq!(width * height >= MIN_PIXELS_PER_THREAD * 2, width > 100);
+            let pixels: Vec<u8> = (0..width * height)
+                .flat_map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    [(x * 7) as u8, (y * 17) as u8, 128, 255]
+                })
+                .collect();
+            let frame = Frame {
+                width: width as u32,
+                height: height as u32,
+                pixels: &pixels,
+            };
 
-        let mut out = Vec::new();
-        encode_sixel(frame, &mut out).unwrap();
-        let decoded = decode_sixel(&String::from_utf8(out).unwrap(), width, height);
+            let mut out = Vec::new();
+            encode_sixel(frame, &mut out).unwrap();
+            let decoded = decode_sixel(&String::from_utf8(out).unwrap(), width, height);
 
-        let expected = sixel_quantize(frame);
-        for (pixel, (decoded, expected)) in decoded.iter().zip(&expected).enumerate() {
-            assert_eq!(*decoded, Some(*expected as usize), "pixel {pixel}");
+            let expected = sixel_quantize(frame);
+            for (pixel, (decoded, expected)) in decoded.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    *decoded,
+                    Some(*expected as usize),
+                    "{width}x{height} pixel {pixel}"
+                );
+            }
         }
     }
 
@@ -253,7 +335,7 @@ mod tests {
     #[test]
     fn sixel_runs() {
         let mut out = Vec::new();
-        write_sixel_runs(&[1, 1, 1, 1, 1, 2, 2, 0], &mut out).unwrap();
+        write_sixel_runs(&[1, 1, 1, 1, 1, 2, 2, 0], &mut out);
         assert_eq!(String::from_utf8(out).unwrap(), "!5@AA?");
     }
 }

@@ -3,10 +3,14 @@ use std::io;
 use crossterm::{
     cursor::{MoveRight, MoveTo},
     queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Color, Print, ResetColor},
 };
 
-use super::{Frame, Layout, start_row};
+use super::{
+    Frame, Layout,
+    parallel::{available_threads, split_across},
+    start_row,
+};
 
 // Source pixels per cell in the character modes, roughly square
 pub const CELL_COLUMNS: usize = 2;
@@ -62,52 +66,88 @@ pub struct CellSymbol {
     pub background: [u8; 3],
 }
 
+// Multiplying by these divides by a region's pixel count
+const RECIPROCALS: [f32; CELL_PIXELS + 1] = {
+    let mut table = [0.0; CELL_PIXELS + 1];
+    let mut count = 1;
+    while count <= CELL_PIXELS {
+        table[count] = 1.0 / count as f32;
+        count += 1;
+    }
+    table
+};
+
+// A pixel's channels in 16-bit lanes, so sums of a cell's pixels add all
+// three at once without overflowing
+fn pack([r, g, b]: [u8; 3]) -> u64 {
+    u64::from(r) | u64::from(g) << 16 | u64::from(b) << 32
+}
+
+fn unpack(lanes: u64) -> [u32; 3] {
+    [0, 16, 32].map(|shift| (lanes >> shift & 0xffff) as u32)
+}
+
 // Only pixels in `present` take part, for cells at the frame's edge
 pub fn best_symbol(pixels: &[[u8; 3]; CELL_PIXELS], present: u8) -> CellSymbol {
-    let sums = |mask: u8| {
-        let mut sum = [0f32; 3];
-        let mut count = 0f32;
-        for (bit, pixel) in pixels.iter().enumerate() {
-            if mask & present & (1 << bit) != 0 {
-                for (total, &value) in sum.iter_mut().zip(pixel) {
-                    *total += f32::from(value);
-                }
-                count += 1.0;
-            }
+    let pixels: [u64; CELL_PIXELS] = std::array::from_fn(|bit| {
+        if present & (1 << bit) != 0 {
+            pack(pixels[bit])
+        } else {
+            0
         }
-        (sum, count)
+    });
+    // The sums of every subset of each half's four pixels, so a region's sum
+    // is two lookups
+    let half_sums = |half: &[u64]| {
+        let mut sums = [0; 16];
+        for subset in 1..16usize {
+            sums[subset] = sums[subset & (subset - 1)] + half[subset.trailing_zeros() as usize];
+        }
+        sums
     };
-    let mean = |(sum, count): ([f32; 3], f32)| sum.map(|s| (s / count).round() as u8);
+    let (top, bottom) = (half_sums(&pixels[..4]), half_sums(&pixels[4..]));
+    let sum = |mask: u8| top[usize::from(mask & 0xf)] + bottom[usize::from(mask >> 4)];
+    let mean =
+        |sum: u64, count: u32| unpack(sum).map(|s| ((2 * s + count) / (2 * count).max(1)) as u8);
     // Squared error is constant minus sum^2 / count for each region, so the
     // best split maximizes this
-    let score = |(sum, count): ([f32; 3], f32)| sum.iter().map(|s| s * s / count).sum::<f32>();
-
-    let all = sums(u8::MAX);
-    let flat = CellSymbol {
-        symbol: ' ',
-        foreground: mean(all),
-        background: mean(all),
+    let score = |sum: u64, count: u32| {
+        let [r, g, b] = unpack(sum);
+        (r * r + g * g + b * b) as f32 * RECIPROCALS[count as usize]
     };
-    let mut best = (score(all) + MIN_SHAPE_IMPROVEMENT, flat);
 
-    for &(symbol, mask) in &SYMBOLS[1..] {
-        let (inside, outside) = (sums(mask), sums(!mask));
-        if inside.1 == 0.0 || outside.1 == 0.0 {
-            continue;
-        }
-        let candidate = score(inside) + score(outside);
-        if candidate > best.0 {
-            best = (
-                candidate,
-                CellSymbol {
-                    symbol,
-                    foreground: mean(inside),
-                    background: mean(outside),
-                },
-            );
-        }
+    let (total, total_count) = (sum(present), present.count_ones());
+    let mut best_score = score(total, total_count) + MIN_SHAPE_IMPROVEMENT;
+    // Chosen without branches, which random-looking cells would mispredict
+    let mut best = 0;
+    for (index, &(_, mask)) in SYMBOLS.iter().enumerate().skip(1) {
+        let inside_mask = mask & present;
+        let inside_count = inside_mask.count_ones();
+        let outside_count = total_count - inside_count;
+        let inside = sum(inside_mask);
+        let candidate = if inside_count == 0 || outside_count == 0 {
+            f32::NEG_INFINITY
+        } else {
+            score(inside, inside_count) + score(total - inside, outside_count)
+        };
+        let better = candidate > best_score;
+        best_score = if better { candidate } else { best_score };
+        best = if better { index } else { best };
     }
-    best.1
+
+    let (symbol, mask) = SYMBOLS[best];
+    let inside_mask = if best == 0 { present } else { mask & present };
+    let (inside, inside_count) = (sum(inside_mask), inside_mask.count_ones());
+    let (outside, outside_count) = if best == 0 {
+        (total, total_count)
+    } else {
+        (total - inside, total_count - inside_count)
+    };
+    CellSymbol {
+        symbol,
+        foreground: mean(inside, inside_count),
+        background: mean(outside, outside_count),
+    }
 }
 
 // A cell as the terminal shows it: the symbol, its foreground color unless
@@ -228,19 +268,49 @@ pub enum ColorDepth {
 
 // The cell's pixels and a mask of those inside the frame
 fn cell_pixels(frame: Frame, col: usize, row: usize) -> ([[u8; 3]; CELL_PIXELS], u8) {
+    let width = frame.width as usize;
+    let (left, top) = (col * CELL_COLUMNS, row * CELL_ROWS);
+    let columns = CELL_COLUMNS.min(width - left);
+    let rows = CELL_ROWS.min(frame.height as usize - top);
     let mut pixels = [[0; 3]; CELL_PIXELS];
     let mut present = 0;
-    for dy in 0..CELL_ROWS {
-        for dx in 0..CELL_COLUMNS {
-            let (x, y) = (col * CELL_COLUMNS + dx, row * CELL_ROWS + dy);
-            if x < frame.width as usize && y < frame.height as usize {
-                let bit = dy * CELL_COLUMNS + dx;
-                pixels[bit] = frame.pixel(x, y);
-                present |= 1 << bit;
-            }
+    for dy in 0..rows {
+        let start = ((top + dy) * width + left) * 4;
+        let row = frame.pixels[start..start + columns * 4].as_chunks::<4>().0;
+        for (dx, &[r, g, b, _]) in row.iter().enumerate() {
+            let bit = dy * CELL_COLUMNS + dx;
+            pixels[bit] = [r, g, b];
+            present |= 1 << bit;
         }
     }
     (pixels, present)
+}
+
+// Threads are worth starting only for at least this many cells each
+const MIN_CELLS_PER_THREAD: usize = 2048;
+
+// `analyse` for every cell, row by row, on several threads. None when the
+// frame is too small for that to pay, so cells are better analysed as drawn.
+fn analyse_cells<C: Send>(
+    (cols, rows): (usize, usize),
+    analyse: impl Fn(usize, usize) -> C + Sync,
+) -> Option<Vec<C>> {
+    let analyse_rows = |rows: std::ops::Range<usize>| {
+        let mut cells = Vec::with_capacity(rows.len() * cols);
+        for row in rows {
+            cells.extend((0..cols).map(|col| analyse(col, row)));
+        }
+        cells
+    };
+    let threads = available_threads().min(cols * rows / MIN_CELLS_PER_THREAD);
+    if threads <= 1 {
+        return None;
+    }
+    let mut cells = Vec::with_capacity(cols * rows);
+    for band in split_across(rows, threads, analyse_rows) {
+        cells.extend(band);
+    }
+    Some(cells)
 }
 
 fn cell_extent(frame: Frame, cols: usize, rows: usize) -> (usize, usize) {
@@ -262,50 +332,160 @@ pub fn encode_symbols<F: CellFilter<SymbolCell>>(
         ColorDepth::Truecolor => Color::Rgb { r, g, b },
         ColorDepth::Palette => Color::AnsiValue(ansi_colours::ansi256_from_rgb([r, g, b])),
     };
-    let mut cursor = Cursor::new(cols);
-    let (cols, rows) = cell_extent(frame, cols, rows);
-    filter.start((cols, rows));
+    let screen_columns = cols;
+    let extent = cell_extent(frame, cols, rows);
+    filter.start(extent);
+    let analyse = |col, row| {
+        let (pixels, present) = cell_pixels(frame, col, row);
+        let cell = best_symbol(&pixels, present);
+        // A space shows only the background
+        let foreground = (cell.symbol != ' ').then(|| to_color(cell.foreground));
+        (cell.symbol, foreground, to_color(cell.background))
+    };
+    let draw = Draw {
+        extent,
+        screen_columns,
+        layout,
+    };
+    match analyse_cells(extent, analyse) {
+        Some(cells) => draw.symbols(|col, row| cells[row * extent.0 + col], filter, out),
+        None => draw.symbols(analyse, filter, out),
+    }
+}
 
-    // Only emit colors when they change
-    let (mut foreground, mut background) = (None, None);
-    for row in 0..rows {
-        if F::DRAWS_ALL {
-            start_row(layout, row, out)?;
-            if layout == Layout::Inline {
-                (foreground, background) = (None, None);
+// How cells are laid out on screen
+struct Draw {
+    // In cells
+    extent: (usize, usize),
+    screen_columns: usize,
+    layout: Layout,
+}
+
+impl Draw {
+    // Generic over where cells come from, so each source gets its own loop
+    fn symbols<F: CellFilter<SymbolCell>>(
+        &self,
+        cell: impl Fn(usize, usize) -> SymbolCell,
+        filter: &mut F,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let (cols, rows) = self.extent;
+        let mut cursor = Cursor::new(self.screen_columns);
+        // Only emit colors when they change
+        let (mut foreground, mut background) = (None, None);
+        for row in 0..rows {
+            if F::DRAWS_ALL {
+                start_row(self.layout, row, out)?;
+                if self.layout == Layout::Inline {
+                    (foreground, background) = (None, None);
+                }
+            }
+            for col in 0..cols {
+                let shown = cell(col, row);
+                if !filter.changed(row * cols + col, shown) {
+                    continue;
+                }
+                let (symbol, new_foreground, new_background) = shown;
+                if !F::DRAWS_ALL {
+                    cursor.go_to(col, row, out)?;
+                }
+
+                // Both colors go in one sequence when both change
+                let set_background = background != Some(new_background);
+                let set_foreground = new_foreground.filter(|&color| foreground != Some(color));
+                if set_background || set_foreground.is_some() {
+                    out.extend_from_slice(b"\x1b[");
+                    if set_background {
+                        push_color(b"48", new_background, out);
+                        background = Some(new_background);
+                    }
+                    if let Some(color) = set_foreground {
+                        if set_background {
+                            out.push(b';');
+                        }
+                        push_color(b"38", color, out);
+                        foreground = Some(color);
+                    }
+                    out.push(b'm');
+                }
+                out.extend_from_slice(symbol.encode_utf8(&mut [0; 4]).as_bytes());
+                if !F::DRAWS_ALL {
+                    cursor.printed(col, row);
+                }
             }
         }
-        for col in 0..cols {
-            let (pixels, present) = cell_pixels(frame, col, row);
-            let cell = best_symbol(&pixels, present);
-            let new_background = to_color(cell.background);
-            // A space shows only the background
-            let new_foreground = (cell.symbol != ' ').then(|| to_color(cell.foreground));
-            let shown = (cell.symbol, new_foreground, new_background);
-            if !filter.changed(row * cols + col, shown) {
+        queue!(out, ResetColor)
+    }
+
+    fn mono_glyphs<F: CellFilter<char>>(
+        &self,
+        glyph: impl Fn(usize, usize) -> char,
+        filter: &mut F,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let (cols, rows) = self.extent;
+        let mut cursor = Cursor::new(self.screen_columns);
+        queue!(out, ResetColor)?;
+        for row in 0..rows {
+            if F::DRAWS_ALL {
+                start_row(self.layout, row, out)?;
+                let line: String = (0..cols).map(|col| glyph(col, row)).collect();
+                queue!(out, Print(line))?;
                 continue;
             }
-            if !F::DRAWS_ALL {
-                cursor.go_to(col, row, out)?;
-            }
-
-            if background != Some(new_background) {
-                queue!(out, SetBackgroundColor(new_background))?;
-                background = Some(new_background);
-            }
-            if let Some(new_foreground) = new_foreground
-                && foreground != Some(new_foreground)
-            {
-                queue!(out, SetForegroundColor(new_foreground))?;
-                foreground = Some(new_foreground);
-            }
-            queue!(out, Print(cell.symbol))?;
-            if !F::DRAWS_ALL {
-                cursor.printed(col, row);
+            for col in 0..cols {
+                let glyph = glyph(col, row);
+                if filter.changed(row * cols + col, glyph) {
+                    cursor.go_to(col, row, out)?;
+                    queue!(out, Print(glyph))?;
+                    cursor.printed(col, row);
+                }
             }
         }
+        Ok(())
     }
-    queue!(out, ResetColor)
+}
+
+// Every byte's decimal digits, so colors are written without formatting
+const DECIMAL: [([u8; 3], usize); 256] = {
+    let mut table = [([0; 3], 0); 256];
+    let mut value = 0;
+    while value < 256 {
+        let (hundreds, tens, ones) = (value / 100, value / 10 % 10, value % 10);
+        let digits = [b'0' + hundreds as u8, b'0' + tens as u8, b'0' + ones as u8];
+        table[value] = match value {
+            0..10 => ([digits[2], 0, 0], 1),
+            10..100 => ([digits[1], digits[2], 0], 2),
+            _ => (digits, 3),
+        };
+        value += 1;
+    }
+    table
+};
+
+fn push_decimal(value: u8, out: &mut Vec<u8>) {
+    let (digits, len) = &DECIMAL[usize::from(value)];
+    out.extend_from_slice(&digits[..*len]);
+}
+
+// SGR parameters for a foreground (38) or background (48) color
+fn push_color(layer: &[u8; 2], color: Color, out: &mut Vec<u8>) {
+    out.extend_from_slice(layer);
+    match color {
+        Color::Rgb { r, g, b } => {
+            out.extend_from_slice(b";2;");
+            push_decimal(r, out);
+            out.push(b';');
+            push_decimal(g, out);
+            out.push(b';');
+            push_decimal(b, out);
+        }
+        Color::AnsiValue(index) => {
+            out.extend_from_slice(b";5;");
+            push_decimal(index, out);
+        }
+        _ => unreachable!("cells are drawn in RGB or palette colors"),
+    }
 }
 
 // Glyphs with the coverage of their top and bottom halves. All are in code
@@ -321,13 +501,15 @@ const MONO_GLYPHS: [(char, f32, f32); 7] = [
 ];
 
 pub fn best_mono_glyph(top: f32, bottom: f32) -> char {
-    let error = |&(_, glyph_top, glyph_bottom): &(char, f32, f32)| {
-        (glyph_top - top).powi(2) + (glyph_bottom - bottom).powi(2)
-    };
-    MONO_GLYPHS
-        .iter()
-        .min_by(|a, b| error(a).total_cmp(&error(b)))
-        .map_or(' ', |&(glyph, _, _)| glyph)
+    // The first with the least error
+    let mut best = (' ', f32::INFINITY);
+    for &(glyph, glyph_top, glyph_bottom) in &MONO_GLYPHS {
+        let error = (glyph_top - top).powi(2) + (glyph_bottom - bottom).powi(2);
+        if error < best.1 {
+            best = (glyph, error);
+        }
+    }
+    best.0
 }
 
 // In the terminal's own foreground and background colors
@@ -338,56 +520,50 @@ pub fn encode_mono_blocks<F: CellFilter<char>>(
     filter: &mut F,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let mut cursor = Cursor::new(cols);
-    let (cols, rows) = cell_extent(frame, cols, rows);
-    filter.start((cols, rows));
-    // Average luminance of a cell's top or bottom half, from 0 to 1
+    let screen_columns = cols;
+    let extent = cell_extent(frame, cols, rows);
+    filter.start(extent);
+    // Average luminance of a cell's top or bottom half, from 0 to 1. Pixels
+    // outside the frame add nothing.
     let brightness = |pixels: &[[u8; 3]; CELL_PIXELS], present: u8, half: usize| {
-        let half_rows = CELL_ROWS / 2;
-        let (mut total, mut count) = (0.0, 0.0);
-        for dy in half * half_rows..(half + 1) * half_rows {
-            for dx in 0..CELL_COLUMNS {
-                let bit = dy * CELL_COLUMNS + dx;
+        let half_pixels = CELL_PIXELS / 2;
+        let bits = half * half_pixels..(half + 1) * half_pixels;
+        let count = (present >> bits.start & ((1 << half_pixels) - 1)).count_ones();
+        let total: f32 = bits
+            .map(|bit| {
+                let [r, g, b] = pixels[bit];
+                let luminance =
+                    0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
                 if present & (1 << bit) != 0 {
-                    let [r, g, b] = pixels[bit];
-                    total += 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
-                    count += 1.0;
+                    luminance
+                } else {
+                    0.0
                 }
-            }
-        }
-        if count > 0.0 {
-            total / count / 255.0
+            })
+            .sum();
+        if count > 0 {
+            total / count as f32 / 255.0
         } else {
             0.0
         }
     };
 
-    let glyph = |col, row| {
+    let analyse = |col, row| {
         let (pixels, present) = cell_pixels(frame, col, row);
         best_mono_glyph(
             brightness(&pixels, present, 0),
             brightness(&pixels, present, 1),
         )
     };
-
-    queue!(out, ResetColor)?;
-    for row in 0..rows {
-        if F::DRAWS_ALL {
-            start_row(layout, row, out)?;
-            let line: String = (0..cols).map(|col| glyph(col, row)).collect();
-            queue!(out, Print(line))?;
-            continue;
-        }
-        for col in 0..cols {
-            let glyph = glyph(col, row);
-            if filter.changed(row * cols + col, glyph) {
-                cursor.go_to(col, row, out)?;
-                queue!(out, Print(glyph))?;
-                cursor.printed(col, row);
-            }
-        }
+    let draw = Draw {
+        extent,
+        screen_columns,
+        layout,
+    };
+    match analyse_cells(extent, analyse) {
+        Some(glyphs) => draw.mono_glyphs(|col, row| glyphs[row * extent.0 + col], filter, out),
+        None => draw.mono_glyphs(analyse, filter, out),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -513,6 +689,54 @@ mod tests {
         assert_eq!(text.matches(' ').count(), 2, "{text:?}");
         assert_eq!(text.matches("48;2;128;128;128").count(), 1, "{text:?}");
         assert_eq!(text.matches("2;255;0;0").count(), 1, "{text:?}");
+    }
+
+    #[test]
+    fn colors_are_written_like_crossterm() {
+        use crossterm::style::{SetBackgroundColor, SetForegroundColor};
+        for value in [0, 7, 9, 10, 42, 99, 100, 128, 199, 255] {
+            for color in [
+                Color::Rgb {
+                    r: value,
+                    g: 255 - value,
+                    b: value / 2,
+                },
+                Color::AnsiValue(value),
+            ] {
+                let mut ours = b"\x1b[".to_vec();
+                push_color(b"48", color, &mut ours);
+                ours.extend_from_slice(b"m\x1b[");
+                push_color(b"38", color, &mut ours);
+                ours.push(b'm');
+                let mut expected = Vec::new();
+                queue!(
+                    expected,
+                    SetBackgroundColor(color),
+                    SetForegroundColor(color)
+                )
+                .unwrap();
+                assert_eq!(
+                    String::from_utf8(ours).unwrap(),
+                    String::from_utf8(expected).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cells_analysed_on_threads_stay_in_order() {
+        // Enough cells for several threads, in rows that don't split evenly
+        for (cols, rows) in [(300, 67), (2, MIN_CELLS_PER_THREAD * 5 + 1), (7, 3)] {
+            let cells = analyse_cells((cols, rows), |col, row| (col, row));
+            if cols * rows < MIN_CELLS_PER_THREAD * 2 {
+                assert_eq!(cells, None);
+                continue;
+            }
+            let expected: Vec<_> = (0..rows)
+                .flat_map(|row| (0..cols).map(move |col| (col, row)))
+                .collect();
+            assert_eq!(cells, Some(expected), "{cols}x{rows}");
+        }
     }
 
     #[test]

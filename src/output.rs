@@ -9,6 +9,7 @@ use crossterm::{
 mod characters;
 mod detect;
 mod kitty;
+mod parallel;
 mod sixel;
 
 #[cfg(test)]
@@ -52,15 +53,6 @@ pub struct Frame<'a> {
 }
 
 impl Frame<'_> {
-    fn pixel(&self, x: usize, y: usize) -> [u8; 3] {
-        let start = (y * self.width as usize + x) * 4;
-        [
-            self.pixels[start],
-            self.pixels[start + 1],
-            self.pixels[start + 2],
-        ]
-    }
-
     // The top-left part, at most width by height
     pub fn cropped(&self, width: u32, height: u32) -> Vec<u8> {
         let width = width.min(self.width) as usize;
