@@ -1,6 +1,6 @@
 [package]
 name = "termblit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Stream RGBA frames to the terminal with Kitty graphics, Sixel or colored characters"
 license = "Apache-2.0"
