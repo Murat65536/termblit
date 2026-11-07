@@ -1,6 +1,7 @@
 use std::io;
 
 use crossterm::{
+    cursor::{MoveRight, MoveTo},
     queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
 };
@@ -109,6 +110,115 @@ pub fn best_symbol(pixels: &[[u8; 3]; CELL_PIXELS], present: u8) -> CellSymbol {
     best.1
 }
 
+// A cell as the terminal shows it: the symbol, its foreground color unless
+// it's a space, and the background color
+pub type SymbolCell = (char, Option<Color>, Color);
+
+// Picks the cells of a frame to draw. Generic, so drawing them all costs no
+// more than it would without a filter.
+pub trait CellFilter<C> {
+    // Every cell is drawn, in order, so the cursor needn't be moved between them
+    const DRAWS_ALL: bool;
+    // Called before each frame with its size in cells
+    fn start(&mut self, extent: (usize, usize));
+    // Whether to draw the cell at this index, counting row by row
+    fn changed(&mut self, index: usize, cell: C) -> bool;
+}
+
+pub struct AllCells;
+
+impl<C> CellFilter<C> for AllCells {
+    const DRAWS_ALL: bool = true;
+
+    fn start(&mut self, _: (usize, usize)) {}
+
+    fn changed(&mut self, _: usize, _: C) -> bool {
+        true
+    }
+}
+
+// The cells on screen, so only those that change are drawn. Only for frames
+// drawn from the top of the screen.
+pub struct ChangedCells<C> {
+    // Row by row; empty when the screen doesn't show the last frame
+    shown: Vec<C>,
+    extent: (usize, usize),
+}
+
+impl<C> Default for ChangedCells<C> {
+    fn default() -> Self {
+        Self {
+            shown: Vec::new(),
+            extent: (0, 0),
+        }
+    }
+}
+
+impl<C> ChangedCells<C> {
+    // Draw every cell of the next frame
+    pub fn forget(&mut self) {
+        self.shown.clear();
+    }
+}
+
+impl<C: Copy + PartialEq> CellFilter<C> for ChangedCells<C> {
+    const DRAWS_ALL: bool = false;
+
+    fn start(&mut self, extent: (usize, usize)) {
+        if extent != self.extent {
+            self.forget();
+            self.extent = extent;
+        }
+    }
+
+    fn changed(&mut self, index: usize, cell: C) -> bool {
+        match self.shown.get_mut(index) {
+            Some(shown) if *shown == cell => false,
+            Some(shown) => {
+                *shown = cell;
+                true
+            }
+            None => {
+                debug_assert_eq!(index, self.shown.len());
+                self.shown.push(cell);
+                true
+            }
+        }
+    }
+}
+
+// Where the next character prints, so the cursor is moved only past cells
+// that aren't drawn
+struct Cursor {
+    position: Option<(usize, usize)>,
+    screen_columns: usize,
+}
+
+impl Cursor {
+    fn new(screen_columns: usize) -> Self {
+        Self {
+            position: None,
+            screen_columns,
+        }
+    }
+
+    fn go_to(&mut self, col: usize, row: usize, out: &mut Vec<u8>) -> io::Result<()> {
+        match self.position {
+            Some(position) if position == (col, row) => Ok(()),
+            Some((from, on)) if on == row && from < col => {
+                queue!(out, MoveRight((col - from) as u16))
+            }
+            _ => queue!(out, MoveTo(col as u16, row as u16)),
+        }
+    }
+
+    // Printing in the last column leaves the cursor waiting to wrap, so where
+    // the next character goes isn't known
+    fn printed(&mut self, col: usize, row: usize) {
+        self.position = (col + 1 < self.screen_columns).then_some((col + 1, row));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ColorDepth {
     Truecolor,
@@ -140,44 +250,59 @@ fn cell_extent(frame: Frame, cols: usize, rows: usize) -> (usize, usize) {
     )
 }
 
-pub fn encode_symbols(
+pub fn encode_symbols<F: CellFilter<SymbolCell>>(
     frame: Frame,
     (cols, rows): (usize, usize),
     depth: ColorDepth,
     layout: Layout,
+    filter: &mut F,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
     let to_color = |[r, g, b]: [u8; 3]| match depth {
         ColorDepth::Truecolor => Color::Rgb { r, g, b },
         ColorDepth::Palette => Color::AnsiValue(ansi_colours::ansi256_from_rgb([r, g, b])),
     };
+    let mut cursor = Cursor::new(cols);
     let (cols, rows) = cell_extent(frame, cols, rows);
+    filter.start((cols, rows));
 
     // Only emit colors when they change
     let (mut foreground, mut background) = (None, None);
     for row in 0..rows {
-        start_row(layout, row, out)?;
-        if layout == Layout::Inline {
-            (foreground, background) = (None, None);
+        if F::DRAWS_ALL {
+            start_row(layout, row, out)?;
+            if layout == Layout::Inline {
+                (foreground, background) = (None, None);
+            }
         }
         for col in 0..cols {
             let (pixels, present) = cell_pixels(frame, col, row);
             let cell = best_symbol(&pixels, present);
-
             let new_background = to_color(cell.background);
+            // A space shows only the background
+            let new_foreground = (cell.symbol != ' ').then(|| to_color(cell.foreground));
+            let shown = (cell.symbol, new_foreground, new_background);
+            if !filter.changed(row * cols + col, shown) {
+                continue;
+            }
+            if !F::DRAWS_ALL {
+                cursor.go_to(col, row, out)?;
+            }
+
             if background != Some(new_background) {
                 queue!(out, SetBackgroundColor(new_background))?;
                 background = Some(new_background);
             }
-            // A space shows only the background
-            if cell.symbol != ' ' {
-                let new_foreground = to_color(cell.foreground);
-                if foreground != Some(new_foreground) {
-                    queue!(out, SetForegroundColor(new_foreground))?;
-                    foreground = Some(new_foreground);
-                }
+            if let Some(new_foreground) = new_foreground
+                && foreground != Some(new_foreground)
+            {
+                queue!(out, SetForegroundColor(new_foreground))?;
+                foreground = Some(new_foreground);
             }
             queue!(out, Print(cell.symbol))?;
+            if !F::DRAWS_ALL {
+                cursor.printed(col, row);
+            }
         }
     }
     queue!(out, ResetColor)
@@ -206,13 +331,16 @@ pub fn best_mono_glyph(top: f32, bottom: f32) -> char {
 }
 
 // In the terminal's own foreground and background colors
-pub fn encode_mono_blocks(
+pub fn encode_mono_blocks<F: CellFilter<char>>(
     frame: Frame,
     (cols, rows): (usize, usize),
     layout: Layout,
+    filter: &mut F,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
+    let mut cursor = Cursor::new(cols);
     let (cols, rows) = cell_extent(frame, cols, rows);
+    filter.start((cols, rows));
     // Average luminance of a cell's top or bottom half, from 0 to 1
     let brightness = |pixels: &[[u8; 3]; CELL_PIXELS], present: u8, half: usize| {
         let half_rows = CELL_ROWS / 2;
@@ -234,19 +362,30 @@ pub fn encode_mono_blocks(
         }
     };
 
+    let glyph = |col, row| {
+        let (pixels, present) = cell_pixels(frame, col, row);
+        best_mono_glyph(
+            brightness(&pixels, present, 0),
+            brightness(&pixels, present, 1),
+        )
+    };
+
     queue!(out, ResetColor)?;
     for row in 0..rows {
-        start_row(layout, row, out)?;
-        let line: String = (0..cols)
-            .map(|col| {
-                let (pixels, present) = cell_pixels(frame, col, row);
-                best_mono_glyph(
-                    brightness(&pixels, present, 0),
-                    brightness(&pixels, present, 1),
-                )
-            })
-            .collect();
-        queue!(out, Print(line))?;
+        if F::DRAWS_ALL {
+            start_row(layout, row, out)?;
+            let line: String = (0..cols).map(|col| glyph(col, row)).collect();
+            queue!(out, Print(line))?;
+            continue;
+        }
+        for col in 0..cols {
+            let glyph = glyph(col, row);
+            if filter.changed(row * cols + col, glyph) {
+                cursor.go_to(col, row, out)?;
+                queue!(out, Print(glyph))?;
+                cursor.printed(col, row);
+            }
+        }
     }
     Ok(())
 }
@@ -347,7 +486,15 @@ mod tests {
 
     fn encode(frame: Frame, cols: usize, rows: usize, depth: ColorDepth) -> String {
         let mut out = Vec::new();
-        encode_symbols(frame, (cols, rows), depth, Layout::Screen, &mut out).unwrap();
+        encode_symbols(
+            frame,
+            (cols, rows),
+            depth,
+            Layout::Screen,
+            &mut AllCells,
+            &mut out,
+        )
+        .unwrap();
         String::from_utf8(out).unwrap()
     }
 

@@ -13,11 +13,15 @@ mod sixel;
 
 #[cfg(test)]
 pub use characters::symbol_mask;
-pub use characters::{CELL_COLUMNS, CELL_ROWS, ColorDepth, encode_mono_blocks, encode_symbols};
+pub use characters::{
+    AllCells, CELL_COLUMNS, CELL_ROWS, ChangedCells, ColorDepth, SymbolCell, encode_mono_blocks,
+    encode_symbols,
+};
 pub use detect::detect;
 pub use kitty::{
-    KittyPlacement, KittyPosition, encode_kitty, encode_kitty_placeholders, encode_kitty_shared,
-    kitty_delete, wrap_for_tmux,
+    ChangedPixels, KittyPlacement, KittyPosition, bounding_rect, encode_kitty, encode_kitty_edit,
+    encode_kitty_edit_shared, encode_kitty_placeholders, encode_kitty_shared, kitty_delete,
+    wrap_for_tmux,
 };
 pub use sixel::{SIXEL_DISABLE_SCROLLING, SIXEL_ENABLE_SCROLLING, encode_sixel};
 

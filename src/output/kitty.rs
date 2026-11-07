@@ -43,23 +43,34 @@ impl KittyPlacement {
 }
 
 pub fn encode_kitty(frame: Frame, placement: KittyPlacement, out: &mut Vec<u8>) -> io::Result<()> {
+    let keys = format!(
+        "a=T,f=32,o=z,s={},v={},{}",
+        frame.width,
+        frame.height,
+        placement.keys()
+    );
+    encode_compressed(frame.pixels, &keys, "", out)
+}
+
+// Compressed pixels in chunks, the first with `keys` and the rest with
+// `continuation_keys`
+fn encode_compressed(
+    pixels: &[u8],
+    keys: &str,
+    continuation_keys: &str,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(frame.pixels)?;
+    encoder.write_all(pixels)?;
     let payload = BASE64.encode(encoder.finish()?);
 
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(KITTY_CHUNK_SIZE).collect();
     for (index, chunk) in chunks.iter().enumerate() {
         let more = u8::from(index + 1 < chunks.len());
         if index == 0 {
-            write!(
-                out,
-                "\x1b_Ga=T,f=32,o=z,s={},v={},{},m={more};",
-                frame.width,
-                frame.height,
-                placement.keys()
-            )?;
+            write!(out, "\x1b_G{keys},m={more};")?;
         } else {
-            write!(out, "\x1b_Gm={more};")?;
+            write!(out, "\x1b_G{continuation_keys}m={more};")?;
         }
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\x1b\\");
@@ -82,6 +93,158 @@ pub fn encode_kitty_shared(
         placement.keys(),
         BASE64.encode(shm_name)
     )
+}
+
+// A rectangle of an image, in pixels
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Rect {
+    fn union(self, other: Rect) -> Rect {
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        Rect {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
+    }
+}
+
+// Overwrite a rectangle of the image's pixels, which edits it in place
+fn edit_keys(image_id: u32, rect: Rect) -> String {
+    let Rect {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
+    format!("a=f,i={image_id},r=1,x={x},y={y},s={width},v={height},X=1,f=32,q=2")
+}
+
+// `pixels` are the rectangle's, row by row
+pub fn encode_kitty_edit(
+    image_id: u32,
+    rect: Rect,
+    pixels: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let keys = format!("{},o=z", edit_keys(image_id, rect));
+    // Every chunk of frame data needs a=f
+    encode_compressed(pixels, &keys, "a=f,q=2,", out)
+}
+
+pub fn encode_kitty_edit_shared(
+    image_id: u32,
+    rect: Rect,
+    size: usize,
+    shm_name: &str,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    write!(
+        out,
+        "\x1b_G{},t=s,S={size};{}\x1b\\",
+        edit_keys(image_id, rect),
+        BASE64.encode(shm_name)
+    )
+}
+
+// Changed rows this close together go in one rectangle, saving a command
+const MERGE_GAP_ROWS: u32 = 16;
+
+// The image on screen, so only the parts that change are sent
+#[derive(Default)]
+pub struct ChangedPixels {
+    // Empty when the screen doesn't show the last frame
+    shown: Vec<u8>,
+    width: u32,
+    height: u32,
+    // Changed pixels gathered from rows that are only partly sent
+    scratch: Vec<u8>,
+}
+
+impl ChangedPixels {
+    // Send all of the next frame
+    pub fn forget(&mut self) {
+        self.shown.clear();
+    }
+
+    // The rectangles of the frame that differ from the image shown, which it
+    // then replaces. None if the frame must be sent whole.
+    pub fn changes(&mut self, frame: Frame) -> Option<Vec<Rect>> {
+        if self.shown.is_empty() || (self.width, self.height) != (frame.width, frame.height) {
+            self.shown.clear();
+            self.shown.extend_from_slice(frame.pixels);
+            (self.width, self.height) = (frame.width, frame.height);
+            return None;
+        }
+
+        let row_bytes = frame.width as usize * 4;
+        let rows = self
+            .shown
+            .chunks_exact(row_bytes)
+            .zip(frame.pixels.chunks_exact(row_bytes));
+        let mut rects: Vec<Rect> = Vec::new();
+        for (y, (shown, new)) in rows.enumerate() {
+            if shown == new {
+                continue;
+            }
+            let pixels = || shown.as_chunks::<4>().0.iter().zip(new.as_chunks::<4>().0);
+            let first = pixels().position(|(a, b)| a != b).unwrap_or(0);
+            let last = pixels().rposition(|(a, b)| a != b).unwrap_or(0);
+            let changed = Rect {
+                x: first as u32,
+                y: y as u32,
+                width: (last - first + 1) as u32,
+                height: 1,
+            };
+            match rects.last_mut() {
+                Some(rect) if changed.y - (rect.y + rect.height) < MERGE_GAP_ROWS => {
+                    *rect = rect.union(changed);
+                }
+                _ => rects.push(changed),
+            }
+        }
+
+        for &rect in &rects {
+            for y in rect.y..rect.y + rect.height {
+                let start = (y as usize * frame.width as usize + rect.x as usize) * 4;
+                let span = start..start + rect.width as usize * 4;
+                self.shown[span.clone()].copy_from_slice(&frame.pixels[span]);
+            }
+        }
+        Some(rects)
+    }
+
+    // The rectangle's pixels row by row, copied only when they aren't already
+    pub fn pixels_in<'a>(&'a mut self, frame: Frame<'a>, rect: Rect) -> &'a [u8] {
+        let row_bytes = frame.width as usize * 4;
+        let rows = rect.y as usize..(rect.y + rect.height) as usize;
+        if rect.width == frame.width {
+            return &frame.pixels[rows.start * row_bytes..rows.end * row_bytes];
+        }
+        self.scratch.clear();
+        for row in frame
+            .pixels
+            .chunks_exact(row_bytes)
+            .take(rows.end)
+            .skip(rows.start)
+        {
+            self.scratch
+                .extend_from_slice(&row[rect.x as usize * 4..(rect.x + rect.width) as usize * 4]);
+        }
+        &self.scratch
+    }
+}
+
+// The smallest rectangle covering them all
+pub fn bounding_rect(rects: &[Rect]) -> Option<Rect> {
+    rects.iter().copied().reduce(Rect::union)
 }
 
 // Kitty shows a virtual placement wherever this character is, in the image's

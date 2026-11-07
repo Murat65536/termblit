@@ -21,7 +21,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crate::output::{self, ColorDepth, Frame, KittyPlacement, KittyPosition, Layout, OutputMode};
+use crate::output::{
+    self, AllCells, ChangedCells, ChangedPixels, ColorDepth, Frame, KittyPlacement, KittyPosition,
+    Layout, OutputMode, SymbolCell,
+};
 
 /// How the terminal is set up and frames are sent
 #[derive(Clone, Debug, Default)]
@@ -41,6 +44,11 @@ pub struct Options {
     /// Ask for key release events where the terminal can report them; see
     /// [`Terminal::reports_key_releases`]
     pub key_releases: bool,
+    /// Send only what changed since the last frame. Faster when much of each
+    /// frame stays the same, slower when nearly all of it changes. Applies to
+    /// the character modes and Kitty, where it needs a terminal that can edit
+    /// images in place with animation frames, like Kitty itself.
+    pub diff_frames: bool,
 }
 
 const CHARACTER_CELL_PIXELS: (u32, u32) = (output::CELL_COLUMNS as u32, output::CELL_ROWS as u32);
@@ -166,6 +174,7 @@ impl FrameWriter {
         kitty_image_id: u32,
         shared_memory: SharedMemory,
         tmux: bool,
+        diff_frames: bool,
     ) -> io::Result<Self> {
         let (jobs, job_receiver) = sync_channel::<WriterJob>(0);
         let (recycle, recycled) = channel();
@@ -180,6 +189,7 @@ impl FrameWriter {
                 #[cfg(not(unix))]
                 let _ = shared_memory;
                 let mut placeholders_drawn = None;
+                let mut shown = diff_frames.then(Shown::default);
                 for job in job_receiver {
                     buffer.clear();
                     {
@@ -188,6 +198,9 @@ impl FrameWriter {
                             WriterJob::Clear => {
                                 queue!(buffer, Clear(ClearType::All))?;
                                 placeholders_drawn = None;
+                                if let Some(shown) = &mut shown {
+                                    shown.forget();
+                                }
                             }
                             WriterJob::Frame {
                                 pixels,
@@ -223,6 +236,7 @@ impl FrameWriter {
                                     status.as_deref(),
                                     size,
                                     kitty,
+                                    shown.as_mut(),
                                     &mut buffer,
                                 )?;
                                 // Fails only if the terminal is being dropped
@@ -331,6 +345,7 @@ impl Terminal {
                 kitty_image_id(options),
                 shared_memory,
                 tmux,
+                options.diff_frames,
             )?),
         })
     }
@@ -414,6 +429,33 @@ struct KittyImage<'a> {
     placeholders_drawn: Option<&'a mut Option<(u16, u16)>>,
 }
 
+// What the screen shows, so only what changes is sent
+#[derive(Default)]
+struct Shown {
+    // The terminal size and cell size it was drawn at
+    screen: Option<((u16, u16), (u32, u32))>,
+    symbols: ChangedCells<SymbolCell>,
+    glyphs: ChangedCells<char>,
+    pixels: ChangedPixels,
+}
+
+impl Shown {
+    fn forget(&mut self) {
+        self.symbols.forget();
+        self.glyphs.forget();
+        self.pixels.forget();
+    }
+
+    // Resizing may move or clear what the terminal shows
+    fn check_screen(&mut self, size: (u16, u16), cell_pixels: (u32, u32)) {
+        if self.screen != Some((size, cell_pixels)) {
+            self.forget();
+            self.screen = Some((size, cell_pixels));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compose_frame(
     mode: OutputMode,
     (cell_width, cell_height): (u32, u32),
@@ -421,8 +463,12 @@ fn compose_frame(
     status: Option<&str>,
     (cols, rows): (u16, u16),
     kitty: KittyImage<'_>,
+    mut shown: Option<&mut Shown>,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
+    if let Some(shown) = shown.as_deref_mut() {
+        shown.check_screen((cols, rows), (cell_width, cell_height));
+    }
     let image_rows = rows.saturating_sub(reserved_rows(mode, status.is_some()));
     let (cols_used, rows_used) = (usize::from(cols), usize::from(image_rows));
 
@@ -434,16 +480,46 @@ fn compose_frame(
     }
 
     match mode {
-        OutputMode::TruecolorCharacters => {
+        OutputMode::TruecolorCharacters | OutputMode::PaletteCharacters => {
             let cells = (cols_used, rows_used);
-            output::encode_symbols(frame, cells, ColorDepth::Truecolor, Layout::Screen, out)?;
-        }
-        OutputMode::PaletteCharacters => {
-            let cells = (cols_used, rows_used);
-            output::encode_symbols(frame, cells, ColorDepth::Palette, Layout::Screen, out)?;
+            let depth = if mode == OutputMode::TruecolorCharacters {
+                ColorDepth::Truecolor
+            } else {
+                ColorDepth::Palette
+            };
+            match shown {
+                Some(shown) => {
+                    let filter = &mut shown.symbols;
+                    output::encode_symbols(frame, cells, depth, Layout::Screen, filter, out)?;
+                }
+                None => {
+                    output::encode_symbols(
+                        frame,
+                        cells,
+                        depth,
+                        Layout::Screen,
+                        &mut AllCells,
+                        out,
+                    )?;
+                }
+            }
         }
         OutputMode::BlockCharacters => {
-            output::encode_mono_blocks(frame, (cols_used, rows_used), Layout::Screen, out)?;
+            let cells = (cols_used, rows_used);
+            match shown {
+                Some(shown) => {
+                    output::encode_mono_blocks(
+                        frame,
+                        cells,
+                        Layout::Screen,
+                        &mut shown.glyphs,
+                        out,
+                    )?;
+                }
+                None => {
+                    output::encode_mono_blocks(frame, cells, Layout::Screen, &mut AllCells, out)?
+                }
+            }
         }
         OutputMode::Kitty | OutputMode::Sixel => {
             let max_width = u32::from(cols) * cell_width;
@@ -476,12 +552,15 @@ fn compose_frame(
                         position,
                     };
                     let start = out.len();
-                    match kitty.write_shared.map(|write| write(frame.pixels)) {
-                        Some(Ok(name)) => {
-                            output::encode_kitty_shared(frame, placement, &name, out)?;
-                        }
-                        _ => output::encode_kitty(frame, placement, out)?,
-                    }
+                    let changed = shown.map(|shown| &mut shown.pixels);
+                    encode_kitty_frame(
+                        frame,
+                        kitty.id,
+                        placement,
+                        kitty.write_shared,
+                        changed,
+                        out,
+                    )?;
                     if let Some(drawn) = kitty.placeholders_drawn {
                         let commands = out.split_off(start);
                         output::wrap_for_tmux(&commands, out);
@@ -522,6 +601,40 @@ fn compose_frame(
     Ok(())
 }
 
+// The image whole, or with `shown` holding the one on screen, only the parts
+// that changed
+fn encode_kitty_frame(
+    frame: Frame,
+    id: u32,
+    placement: KittyPlacement,
+    mut write_shared: Option<&mut WriteShared<'_>>,
+    shown: Option<&mut ChangedPixels>,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let changes = shown.and_then(|shown| shown.changes(frame).map(|rects| (shown, rects)));
+    let Some((shown, rects)) = changes else {
+        return match write_shared.map(|write| write(frame.pixels)) {
+            Some(Ok(name)) => output::encode_kitty_shared(frame, placement, &name, out),
+            _ => output::encode_kitty(frame, placement, out),
+        };
+    };
+
+    // The terminal removes each shared memory object it reads, and at most two
+    // may wait unread, so all the changes go in one
+    if let Some(write) = write_shared.as_mut()
+        && let Some(rect) = output::bounding_rect(&rects)
+    {
+        let pixels = shown.pixels_in(frame, rect);
+        if let Ok(name) = write(pixels) {
+            return output::encode_kitty_edit_shared(id, rect, pixels.len(), &name, out);
+        }
+    }
+    for rect in rects {
+        output::encode_kitty_edit(id, rect, shown.pixels_in(frame, rect), out)?;
+    }
+    Ok(())
+}
+
 /// Print one frame at the cursor like text, leaving the cursor below it
 pub fn print_frame(mode: OutputMode, options: &Options, frame: Frame) -> io::Result<()> {
     let mut out = Vec::new();
@@ -549,13 +662,27 @@ fn compose_inline(
     let all = (usize::MAX, usize::MAX);
     match mode {
         OutputMode::TruecolorCharacters => {
-            output::encode_symbols(frame, all, ColorDepth::Truecolor, Layout::Inline, out)?;
+            output::encode_symbols(
+                frame,
+                all,
+                ColorDepth::Truecolor,
+                Layout::Inline,
+                &mut AllCells,
+                out,
+            )?;
         }
         OutputMode::PaletteCharacters => {
-            output::encode_symbols(frame, all, ColorDepth::Palette, Layout::Inline, out)?;
+            output::encode_symbols(
+                frame,
+                all,
+                ColorDepth::Palette,
+                Layout::Inline,
+                &mut AllCells,
+                out,
+            )?;
         }
         OutputMode::BlockCharacters => {
-            output::encode_mono_blocks(frame, all, Layout::Inline, out)?;
+            output::encode_mono_blocks(frame, all, Layout::Inline, &mut AllCells, out)?;
         }
         OutputMode::Kitty if tmux => {
             // Printed images stay in the scrollback, so each needs its own id
@@ -656,6 +783,7 @@ mod tests {
                 write_shared: None,
                 placeholders_drawn: None,
             },
+            None,
             &mut out,
         )
         .unwrap();
@@ -911,6 +1039,7 @@ mod tests {
                 write_shared: Some(write_shared),
                 placeholders_drawn: None,
             },
+            None,
             &mut out,
         )
         .unwrap();
@@ -952,6 +1081,7 @@ mod tests {
                 None,
                 (4, 3),
                 kitty,
+                None,
                 &mut out,
             )
             .unwrap();
@@ -1040,6 +1170,306 @@ mod tests {
         assert_eq!(text.matches('\u{10EEEE}').count(), 4);
         assert!(!text.contains("\x1b[1;1H"), "{text:?}");
         assert!(text.ends_with("\r\n"), "{text:?}");
+    }
+
+    fn recolor_cell(pixels: &mut [u8], width: u32, (col, row): (usize, usize), color: [u8; 3]) {
+        for dy in 0..CELL_ROWS {
+            for dx in 0..CELL_COLUMNS {
+                let (x, y) = (col * CELL_COLUMNS + dx, row * CELL_ROWS + dy);
+                let start = (y * width as usize + x) * 4;
+                pixels[start..start + 3].copy_from_slice(&color);
+            }
+        }
+    }
+
+    // Each frame drawn over the last on one screen, with the bytes each sent
+    fn draw_in_turn(
+        mode: OutputMode,
+        frames: &[Frame],
+        mut shown: Option<&mut Shown>,
+        (cols, rows): (u16, u16),
+    ) -> (vt100::Parser, Vec<Vec<u8>>) {
+        let mut parser = vt100::Parser::new(
+            NonZeroU16::new(rows).unwrap(),
+            NonZeroU16::new(cols).unwrap(),
+            0,
+        );
+        let mut sent = Vec::new();
+        for &frame in frames {
+            let mut out = Vec::new();
+            let kitty = KittyImage {
+                id: 1,
+                write_shared: None,
+                placeholders_drawn: None,
+            };
+            compose_frame(
+                mode,
+                PIXEL_CELL_SIZE,
+                frame,
+                None,
+                (cols, rows),
+                kitty,
+                shown.as_deref_mut(),
+                &mut out,
+            )
+            .unwrap();
+            parser.process(&out);
+            sent.push(out);
+        }
+        (parser, sent)
+    }
+
+    fn assert_same_screen(a: &vt100::Parser, b: &vt100::Parser, (cols, rows): (u16, u16)) {
+        for row in 0..rows {
+            for col in 0..cols {
+                let (a, b) = (
+                    a.screen().cell(row, col).unwrap(),
+                    b.screen().cell(row, col).unwrap(),
+                );
+                // A space shows only its background
+                let shown = |cell: &vt100::Cell| {
+                    let blank = cell.contents().trim().is_empty();
+                    (
+                        cell.contents().to_string(),
+                        (!blank).then(|| cell.fgcolor()),
+                        cell.bgcolor(),
+                    )
+                };
+                assert_eq!(shown(a), shown(b), "({col}, {row})");
+            }
+        }
+    }
+
+    #[test]
+    fn diffed_characters_match_full_redraws() {
+        let size = (8, 5);
+        let (width, height, before) = shaped_frame(8, 5);
+        let mut after = before.clone();
+        // The last column, then the first of the next row, and a run of two
+        for cell in [(7, 0), (0, 1), (3, 3), (4, 3)] {
+            recolor_cell(&mut after, width, cell, [9, 200, 30]);
+        }
+        let frame = |pixels| Frame {
+            width,
+            height,
+            pixels,
+        };
+        let frames = [frame(&before), frame(&after)];
+
+        for mode in [
+            OutputMode::TruecolorCharacters,
+            OutputMode::PaletteCharacters,
+            OutputMode::BlockCharacters,
+        ] {
+            let (full, full_sent) = draw_in_turn(mode, &frames, None, size);
+            let mut shown = Shown::default();
+            let (diffed, diffed_sent) = draw_in_turn(mode, &frames, Some(&mut shown), size);
+            assert_same_screen(&diffed, &full, size);
+            assert_eq!(diffed_sent[0], full_sent[0], "{mode:?}");
+            assert!(
+                diffed_sent[1].len() * 3 < full_sent[1].len(),
+                "{mode:?}: {} of {} bytes",
+                diffed_sent[1].len(),
+                full_sent[1].len()
+            );
+
+            // Nothing changed, so no cells are sent
+            let (_, sent) = draw_in_turn(mode, &frames[1..], Some(&mut shown), size);
+            let text = String::from_utf8(sent[0].clone()).unwrap();
+            assert_eq!(
+                text.replace("\x1b[?2026h", "")
+                    .replace("\x1b[?2026l", "")
+                    .replace("\x1b[0m", ""),
+                "",
+                "{mode:?}"
+            );
+
+            // Once forgotten, everything is drawn again
+            shown.forget();
+            let (_, sent) = draw_in_turn(mode, &frames[1..], Some(&mut shown), size);
+            assert_eq!(sent[0], full_sent[1], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn diffed_characters_redraw_after_resizing() {
+        let (width, height, pixels) = shaped_frame(8, 5);
+        let frame = Frame {
+            width,
+            height,
+            pixels: &pixels,
+        };
+        let mut shown = Shown::default();
+        draw_in_turn(
+            OutputMode::TruecolorCharacters,
+            &[frame],
+            Some(&mut shown),
+            (8, 5),
+        );
+        let (resized, _) = draw_in_turn(
+            OutputMode::TruecolorCharacters,
+            &[frame],
+            Some(&mut shown),
+            (9, 5),
+        );
+        let (full, _) = draw_in_turn(OutputMode::TruecolorCharacters, &[frame], None, (9, 5));
+        assert_same_screen(&resized, &full, (9, 5));
+    }
+
+    // Kitty's commands for image 1 applied to its pixels, as the terminal would
+    fn apply_kitty(image: &mut (u32, u32, Vec<u8>), sent: &[u8]) {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        use std::{collections::HashMap, io::Read};
+
+        let text = String::from_utf8(sent.to_vec()).unwrap();
+        let mut keys = HashMap::new();
+        let mut payload = String::new();
+        for command in text.split("\x1b\\") {
+            let Some((_, command)) = command.split_once("\x1b_G") else {
+                continue;
+            };
+            let (command_keys, data) = command.split_once(';').unwrap();
+            for pair in command_keys.split(',') {
+                let (key, value) = pair.split_once('=').unwrap();
+                keys.entry(key.to_string()).or_insert(value.to_string());
+            }
+            payload.push_str(data);
+            if keys["m"] == "1" {
+                keys.remove("m");
+                continue;
+            }
+
+            let mut pixels = Vec::new();
+            let compressed = BASE64.decode(&payload).unwrap();
+            flate2::read::ZlibDecoder::new(&compressed[..])
+                .read_to_end(&mut pixels)
+                .unwrap();
+            let number = |key: &str| keys.get(key).map_or(0, |v| v.parse::<u32>().unwrap());
+            let (width, height) = (number("s"), number("v"));
+            assert_eq!(pixels.len(), (width * height * 4) as usize);
+            match keys["a"].as_str() {
+                "T" => *image = (width, height, pixels),
+                "f" => {
+                    assert_eq!((number("i"), number("r"), number("X")), (1, 1, 1));
+                    let (x, y) = (number("x"), number("y"));
+                    assert!(x + width <= image.0 && y + height <= image.1);
+                    for row in 0..height {
+                        let to = (((y + row) * image.0 + x) * 4) as usize;
+                        let from = (row * width * 4) as usize;
+                        let span = (width * 4) as usize;
+                        image.2[to..to + span].copy_from_slice(&pixels[from..from + span]);
+                    }
+                }
+                other => panic!("unexpected action {other}"),
+            }
+            keys.clear();
+            payload.clear();
+        }
+    }
+
+    fn kitty_frames() -> (u32, u32, Vec<u8>, Vec<u8>) {
+        let (width, height) = (40u32, 60u32);
+        let before: Vec<u8> = (0..width * height)
+            .flat_map(|i| [(i % width * 6) as u8, (i / width * 4) as u8, 90, 255])
+            .collect();
+        let mut after = before.clone();
+        // Two changes far enough apart to go in separate rectangles
+        for (x, y) in [(3, 5), (30, 7), (12, 44), (13, 45)] {
+            let start = ((y * width + x) * 4) as usize;
+            after[start..start + 4].copy_from_slice(&[255, 0, 255, 255]);
+        }
+        (width, height, before, after)
+    }
+
+    #[test]
+    fn diffed_kitty_frames_edit_the_image() {
+        let (width, height, before, after) = kitty_frames();
+        let frame = |pixels| Frame {
+            width,
+            height,
+            pixels,
+        };
+        let frames = [frame(&before), frame(&after), frame(&after)];
+        let mut shown = Shown::default();
+        let (_, sent) = draw_in_turn(OutputMode::Kitty, &frames, Some(&mut shown), (4, 3));
+
+        let mut image = (0, 0, Vec::new());
+        apply_kitty(&mut image, &sent[0]);
+        assert_eq!(image, (width, height, before.clone()));
+
+        let edits = String::from_utf8(sent[1].clone()).unwrap();
+        assert!(!edits.contains("a=T"), "{edits:?}");
+        assert_eq!(edits.matches("\x1b_Ga=f,i=1,r=1,").count(), 2, "{edits:?}");
+        assert!(edits.contains("x=3,y=5,s=28,v=3,"), "{edits:?}");
+        assert!(edits.contains("x=12,y=44,s=2,v=2,"), "{edits:?}");
+        apply_kitty(&mut image, &sent[1]);
+        assert_eq!(image, (width, height, after.clone()));
+
+        // An unchanged frame sends no image at all
+        assert!(!String::from_utf8_lossy(&sent[2]).contains("\x1b_G"));
+
+        // Clearing the screen deletes the image, so it's sent whole again
+        shown.forget();
+        let (_, sent) = draw_in_turn(OutputMode::Kitty, &frames[2..], Some(&mut shown), (4, 3));
+        assert!(String::from_utf8_lossy(&sent[0]).contains("a=T,"));
+    }
+
+    #[test]
+    fn diffed_kitty_frames_send_one_shared_memory_object() {
+        let (width, height, before, after) = kitty_frames();
+        let mut written = Vec::new();
+        let mut write = |data: &[u8]| {
+            written.push(data.to_vec());
+            Ok(format!("/dcat-test-{}", written.len()))
+        };
+        let mut shown = Shown::default();
+        let mut sent = Vec::new();
+        for pixels in [&before, &after] {
+            let mut out = Vec::new();
+            let frame = Frame {
+                width,
+                height,
+                pixels,
+            };
+            let kitty = KittyImage {
+                id: 1,
+                write_shared: Some(&mut write),
+                placeholders_drawn: None,
+            };
+            compose_frame(
+                OutputMode::Kitty,
+                PIXEL_CELL_SIZE,
+                frame,
+                None,
+                (4, 3),
+                kitty,
+                Some(&mut shown),
+                &mut out,
+            )
+            .unwrap();
+            sent.push(String::from_utf8(out).unwrap());
+        }
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0], before);
+        // Covering both changes: columns 3 to 30, rows 5 to 45
+        let (x, y, w, h) = (3, 5, 28, 41);
+        let expected: Vec<u8> = (y..y + h)
+            .flat_map(|row| {
+                let start = ((row * width + x) * 4) as usize;
+                after[start..start + (w * 4) as usize].to_vec()
+            })
+            .collect();
+        assert_eq!(written[1], expected);
+        assert_eq!(sent[1].matches("\x1b_G").count(), 1, "{:?}", sent[1]);
+        assert!(
+            sent[1].contains(&format!(
+                "a=f,i=1,r=1,x={x},y={y},s={w},v={h},X=1,f=32,q=2,t=s,S={};",
+                expected.len()
+            )),
+            "{:?}",
+            sent[1]
+        );
     }
 
     #[test]
